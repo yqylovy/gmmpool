@@ -17,7 +17,7 @@ type Buffer struct {
 	off  int     // read at &buf[off], write at &buf[len(buf)]
 	size int     // maximum buf size
 
-	block, idx int
+	block int
 }
 
 func (b *Buffer) Bytes() []byte {
@@ -106,7 +106,6 @@ func (blk *block) init(blockidx int) {
 		b.size = blk.size
 
 		b.block = blockidx
-		b.idx = i
 		if i != blk.num-1 {
 			b.next = &bs[i+1]
 			b = b.next
