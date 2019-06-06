@@ -16,6 +16,8 @@ type Buffer struct {
 	next *Buffer // next free buffer
 	off  int     // read at &buf[off], write at &buf[len(buf)]
 	size int     // maximum buf size
+
+	block, idx int
 }
 
 func (b *Buffer) Bytes() []byte {
@@ -69,80 +71,110 @@ func (b *Buffer) ReadAll(r io.Reader) ([]byte, error) {
 	return b.Bytes(), nil // err is EOF, so return nil explicitly
 }
 
-// Pool is a buffer pool.
-type Pool struct {
-	lock sync.Mutex
-	free *Buffer
-	max  int
-	num  int
-	size int
+type block struct {
+	data   []byte
+	unused []*Buffer
+	free   *Buffer
+	used   int
+	num    int
+	size   int
 }
 
-// NewPool new a memory buffer pool struct.
-func NewPool(num, size int) (p *Pool) {
-	p = new(Pool)
-	p.init(num, size)
-	return
+func newBlock(blockidx int, num, size int) *block {
+	blk := &block{
+		data: make([]byte, num*size),
+		num:  num,
+		size: size,
+	}
+	blk.init(blockidx)
+	return blk
 }
 
-// Init init the memory buffer.
-func (p *Pool) Init(num, size int) {
-	p.init(num, size)
-	return
-}
-
-// init init the memory buffer.
-func (p *Pool) init(num, size int) {
-	p.num = num
-	p.size = size
-	p.max = num * size
-	p.grow()
-}
-
-// grow grow the memory buffer size, and update free pointer.
-func (p *Pool) grow() {
+func (blk *block) init(blockidx int) {
 	var (
 		i   int
 		b   *Buffer
 		bs  []Buffer
 		buf []byte
 	)
-	buf = make([]byte, p.max)
-	bs = make([]Buffer, p.num)
-	p.free = &bs[0]
-	b = p.free
-	for i = 1; i < p.num; i++ {
-		b.buf = buf[(i-1)*p.size : i*p.size]
-		b.size = p.size
-		b.next = &bs[i]
-		b = b.next
+	buf = make([]byte, blk.num*blk.size)
+	bs = make([]Buffer, blk.num)
+	blk.free = &bs[0]
+	b = blk.free
+	for i = 0; i < blk.num; i++ {
+		b.buf = buf[i*blk.size : i*blk.size]
+		b.size = blk.size
+
+		b.block = blockidx
+		b.idx = i
+		if i != blk.num-1 {
+			b.next = &bs[i+1]
+			b = b.next
+		}
 	}
-	b.buf = buf[(i-1)*p.size : i*p.size]
-	b.size = p.size
-	b.next = nil
-	return
 }
 
-// Get get a free memory buffer.
-func (p *Pool) Get() (b *Buffer) {
-	p.lock.Lock()
-	if b = p.free; b == nil {
-		p.grow()
-		b = p.free
-	}
-	p.free = b.next
-	p.lock.Unlock()
-	b.Reset()
-	return
+func (blk *block) get() *Buffer {
+	blk.used++
+	ret := blk.free
+	blk.free = ret.next
+	return ret
+}
+func (blk *block) release(buf *Buffer) {
+	blk.used--
+	buf.next = blk.free
+	blk.free = buf
+	buf.Reset()
+}
+func (blk *block) full() bool  { return blk.used == blk.num }
+func (blk *block) empty() bool { return blk.used == 0 }
+
+type Pool struct {
+	sync.Mutex
+	blocks []*block
+	num    int
+	size   int
 }
 
-// Put put back a memory buffer to free.
-func (p *Pool) Put(b *Buffer) {
-	p.lock.Lock()
-	b.next = p.free
-	p.free = b
-	p.lock.Unlock()
+func NewPool(num, size int) (p *Pool) {
+	return &Pool{
+		blocks: []*block{newBlock(0, num, size)},
+		num:    num,
+		size:   size,
+	}
+}
+
+func (pool *Pool) Get() (buf *Buffer) {
+	pool.Lock()
+	for _, blk := range pool.blocks {
+		if !blk.full() {
+			buf = blk.get()
+			pool.Unlock()
+			return
+		}
+	}
+	// all block is full,add new
+	var num int
+	l := len(pool.blocks)
+	if l > 3 {
+		num = pool.num * 4
+	} else {
+		num = pool.blocks[l-1].num * 2
+	}
+	blk := newBlock(l, num, pool.size)
+	pool.blocks = append(pool.blocks, blk)
+	buf = blk.get()
+	pool.Unlock()
 	return
+}
+func (pool *Pool) Put(buf *Buffer) {
+	pool.Lock()
+	blk := pool.blocks[buf.block]
+	blk.release(buf)
+	if buf.block == len(pool.blocks) && blk.empty() {
+		pool.blocks = pool.blocks[:buf.block-1]
+	}
+	pool.Unlock()
 }
 
 type MultiLevelPool struct {
