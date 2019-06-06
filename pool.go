@@ -170,8 +170,13 @@ func (pool *Pool) Put(buf *Buffer) {
 	pool.Lock()
 	blk := pool.blocks[buf.block]
 	blk.release(buf)
-	if buf.block == len(pool.blocks) && blk.empty() {
-		pool.blocks = pool.blocks[:buf.block-1]
+
+	// release the last block
+	if buf.block >= 1 && blk.empty() && buf.block == len(pool.blocks)-1 {
+		pre := pool.blocks[buf.block-1]
+		if float64(pre.used) < float64(pre.num)*0.75 {
+			pool.blocks = pool.blocks[:buf.block-1]
+		}
 	}
 	pool.Unlock()
 }
